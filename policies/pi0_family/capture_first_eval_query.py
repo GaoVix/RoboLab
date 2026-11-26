@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 import runpy
 import socket
@@ -23,6 +24,56 @@ from reproducible_settings import (
     CACHE_SETTINGS, ROOT, SCENE_SEED, build_native, clean_environment, inspect_native_preload, inspect_simulator,
     policy_environment, profile, simulator_environment,
 )
+
+
+def renderer_trace(output: Path):
+    """Read the live renderer state after RGB capture, without updates or settings writes."""
+    import carb.dictionary
+    import carb.settings
+    import omni.kit.app
+
+    trace_path = output / "nrd_trace.jsonl"
+    with trace_path.open("a") as handle:
+        handle.write(json.dumps({"kind": "captured_first_response", "applied_control_steps": 0}) + "\n")
+    settings = carb.settings.get_settings()
+    dictionary = carb.dictionary.get_dictionary()
+    snapshots = {}
+    for path in ["/rtx", "/rtx-transient", "/renderer", "/app/renderer"]:
+        item = settings.get_settings_dictionary(path)
+        snapshots[path] = dictionary.get_dict_copy(item) if item is not None else None
+    (output / "renderer_settings.json").write_text(json.dumps(snapshots, indent=2, default=str))
+
+    from reproducible_settings import sha256
+
+    paths = set()
+    for line in Path("/proc/self/maps").read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6 or not fields[5].startswith("/"):
+            continue
+        path = Path(fields[5])
+        if path.is_file() and any(word in str(path).lower() for word in
+                                  ["hydra.rtx", "libnrd", "libnvidia", "libvulkan", "libcarb", "mdl", "warp.so", "warp-clang", "nrd_controls"]):
+            paths.add(path)
+    libraries = [{"path": str(p), "size": p.stat().st_size, "sha256": sha256(p)} for p in sorted(paths)]
+    modules = {}
+    for name in ["warp", "warp.context", "isaaclab.sensors.camera.tiled_camera",
+                 "isaaclab.sensors.camera.utils", "isaaclab.envs.mdp.observations",
+                 "app_launcher", "isaaclab.app.app_launcher"]:
+        module = sys.modules.get(name)
+        filename = getattr(module, "__file__", None)
+        if filename and Path(filename).is_file():
+            modules[name] = {"path": filename, "sha256": sha256(Path(filename)),
+                             "version": getattr(module, "__version__", None)}
+    app = omni.kit.app.get_app()
+    extensions = app.get_extension_manager().get_extensions()
+    selected = [{"id": e.get("id"), "path": e.get("path"), "enabled": e.get("enabled")}
+                for e in extensions if any(word in e.get("id", "").lower() for word in ["hydra", "rtx", "mdl", "warp"])]
+    info = {"scope": "Read-only metadata after first real RGB/request/response; no app.update/render/step",
+            "loaded_libraries": libraries, "python_modules": modules, "extensions": selected,
+            "app_update_number": app.get_update_number() if hasattr(app, "get_update_number") else None,
+            "environment": {key: os.environ.get(key) for key in
+                            ["LD_PRELOAD", "LD_LIBRARY_PATH", "MDL_SYSTEM_PATH", "MDL_USER_PATH", "ISAAC_PATH", "CARB_APP_PATH"]}}
+    (output / "renderer_components.json").write_text(json.dumps(info, indent=2, default=str))
 
 
 def attach_raw_capture(client, output: Path):
@@ -124,6 +175,8 @@ def simulator_child(output: Path, cli_args: list[str]):
                     "policy_seed": 0, "scene_seed": SCENE_SEED, "profile": profile(),
                     "request_keys": sorted(request), "simulator_packages": packages,
                 }, indent=2))
+                if os.environ.get("ROBOLAB_CAPTURE_RENDERER_TRACE") == "1":
+                    renderer_trace(output)
                 # Normal episode/runner finally blocks close the client and env.
                 # No fake observations or actions are returned to the control loop.
                 raise FirstQueryCaptured
@@ -149,6 +202,8 @@ def main():
     parser.add_argument("--checkpoint", type=Path,
                         default=Path.home() / ".cache/openpi/openpi-assets-simeval/pi05_droid_jointpos")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--trace-renderer", action="store_true",
+                        help="Read NRD calls, effective RTX settings and loaded module fingerprints; no setting overrides")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -183,6 +238,9 @@ def main():
                         raise TimeoutError("Policy startup")
                     time.sleep(1)
             print("Capturing one real ClutterPlasticTask request, seed 0; zero applied control steps...", flush=True)
+            sim_env = simulator_environment(native, 0, 0, python=args.sim_python)
+            if args.trace_renderer:
+                sim_env.update(ROBO_NRD_LOG=str(output / "nrd_trace.jsonl"), ROBOLAB_CAPTURE_RENDERER_TRACE="1")
             with (output / "sim.log").open("w") as log:
                 result = subprocess.run([
                     str(args.sim_python), "-u", str(Path(__file__).resolve()), "--capture-sim", str(output),
@@ -191,10 +249,13 @@ def main():
                     "--remote-host", "127.0.0.1", "--remote-port", str(port),
                     "--output-folder-name", str(output / "diagnostic_only"),
                     "--kit_args", " ".join("--" + key + "=false" for key in CACHE_SETTINGS),
-                ], cwd=ROOT, env=simulator_environment(native, 0, 0, python=args.sim_python),
+                ], cwd=ROOT, env=sim_env,
                     stdout=log, stderr=subprocess.STDOUT)
             if result.returncode or not (output / "capture.json").exists():
                 raise RuntimeError(f"Capture failed (exit {result.returncode}); see {output / 'sim.log'}")
+            if args.trace_renderer and any(not (output / name).is_file() for name in
+                                            ["nrd_trace.jsonl", "renderer_settings.json", "renderer_components.json"]):
+                raise RuntimeError(f"Renderer trace incomplete; see {output / 'sim.log'}")
     finally:
         from run_reproducible import stop
 
@@ -210,6 +271,9 @@ def main():
         for name in ["raw_observation.npz", "request.npz", "clean_actions.npz", "capture.json", "installation.json",
                      "policy.log", "sim.log", "preprocessing.json", "preprocessing_probe.npz", "preprocessing.log"]:
             bundle.write(output / name, arcname=name)
+        for name in ["nrd_trace.jsonl", "renderer_settings.json", "renderer_components.json"]:
+            if (output / name).is_file():
+                bundle.write(output / name, arcname=name)
         task_output = output / "diagnostic_only/ClutterPlasticTask"
         for name, archive_name in [("env_cfg.json", "env_cfg.json"),
                                    ("run_0.reproducible.json", "render_profile.json")]:
