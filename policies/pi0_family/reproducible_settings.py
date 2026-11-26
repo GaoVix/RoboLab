@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -87,16 +88,49 @@ def simulator_environment(native: Path, policy_seed: int, run_index: int) -> dic
     return result
 
 
+def _probe_simulator_installation(roots=None, package_version=None):
+    """Inspect pip or official binary/Docker layouts without importing Isaac Sim."""
+    import hashlib
+    import os
+    import re
+    import sysconfig
+    from importlib.metadata import PackageNotFoundError, version
+    from pathlib import Path
+
+    if roots is None:
+        try:
+            package_version = version("isaacsim")
+        except PackageNotFoundError:
+            package_version = None
+        roots = [Path(sysconfig.get_paths()["purelib"]) / "isaacsim",
+                 Path("/workspace/isaaclab/_isaac_sim"), Path("/isaac-sim")]
+        roots += [Path(os.environ[key]) for key in ["ISAACSIM_PATH", "ISAAC_PATH"] if os.environ.get(key)]
+    libraries = {}
+    binary_versions = set()
+    for root in dict.fromkeys(Path(p).resolve() for p in roots):
+        libs = list(root.glob("extscache/omni.hydra.rtx-*/bin/deps/libNRD.so.3.2.3"))
+        if not libs:
+            continue
+        for path in libs:
+            path = path.resolve()
+            libraries[str(path)] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        if (root / "VERSION").is_file():
+            binary_versions.add((root / "VERSION").read_text().strip())
+    # Binary 5.0.0-rc.45+release... and pip 5.0.0.0 identify the same release
+    # family. The exact NRD binary SHA256 is still checked by the caller.
+    raw = package_version
+    if raw is None and len(binary_versions) == 1:
+        raw = binary_versions.pop()
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?(?:[-+].*)?", raw or "")
+    normalized = ".".join([*match.groups()[:3], match.group(4) or "0"]) if match else raw
+    return {"isaacsim": normalized, "nrd_libraries": sorted(libraries.values(), key=lambda p: p["path"])}
+
+
 def inspect_simulator(python: Path) -> dict:
-    script = """
-import hashlib,json,sysconfig
-from pathlib import Path
-from importlib.metadata import version
-root=Path(sysconfig.get_paths()['purelib'])/'isaacsim'
-libs=list(root.glob('extscache/omni.hydra.rtx-*/bin/deps/libNRD.so.3.2.3'))
-print(json.dumps({'isaacsim':version('isaacsim'),'nrd_libraries':[
- {'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in libs]}))
-"""
+    # python may be the official Docker python.sh wrapper. Inspect its own
+    # environment rather than assuming the launcher's site-packages layout.
+    script = (inspect.getsource(_probe_simulator_installation)
+              + "\nimport json\nprint(json.dumps(_probe_simulator_installation()))\n")
     info = json.loads(subprocess.check_output([str(python), "-c", script], text=True, env=clean_environment()))
     if info["isaacsim"] != "5.0.0.0":
         raise RuntimeError(f"{PROFILE_ID} requires the verified Isaac Sim 5.0.0.0 stack: {info}")

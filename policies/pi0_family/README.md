@@ -92,6 +92,13 @@ camera classes, default action chunking, task success/timeout, and numeric HDF5
 recording are retained. There is **no diagnostic 600-step cap** in this launcher.
 Videos default to off; `--video-mode all` enables the original video recording.
 
+For the official RoboLab Docker image, pass
+`--sim-python /workspace/isaaclab/_isaac_sim/python.sh` and the container paths
+to `--openpi-root`, `--policy-python`, and `--checkpoint`. OpenPI still needs
+its own environment; the RoboLab image includes only the OpenPI client.
+The compatibility check accepts both pip installations and the official binary
+layout (`/isaac-sim/VERSION`), while requiring the same verified NRD SHA256.
+
 Results use the original per-task `run_N.hdf5` and `episode_results.jsonl`
 layout, plus profile/seed/lifecycle metadata and logs. Repeat the exact command
 with the same output directory to skip finished episodes. Use separate output

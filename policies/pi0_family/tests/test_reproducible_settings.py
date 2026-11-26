@@ -1,5 +1,6 @@
 """CPU-only checks for isolation, seed lifecycle, and rejecting mixed profiles."""
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -54,6 +55,42 @@ class ReproducibleSettingsTests(unittest.TestCase):
         with patch.object(settings.subprocess, "check_output", return_value=result):
             with self.assertRaisesRegex(RuntimeError, "requires the verified Isaac Sim"):
                 settings.inspect_simulator(Path("/tmp/python"))
+
+    def test_pip_and_docker_layouts_resolve_same_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "isaac-sim"
+            lib = root / "extscache/omni.hydra.rtx-test/bin/deps/libNRD.so.3.2.3"
+            lib.parent.mkdir(parents=True)
+            lib.write_bytes(b"NRD fixture")
+            pip = settings._probe_simulator_installation([root], "5.0.0.0")
+            (root / "VERSION").write_text("5.0.0-rc.45+release.23960.184afb15.gl\n")
+            alias = Path(directory) / "_isaac_sim"
+            alias.symlink_to(root, target_is_directory=True)
+            docker = settings._probe_simulator_installation([root, alias])
+            self.assertEqual(pip, docker)
+            self.assertEqual(docker["isaacsim"], "5.0.0.0")
+            self.assertEqual(len(docker["nrd_libraries"]), 1)
+            self.assertEqual(docker["nrd_libraries"][0]["sha256"],
+                             hashlib.sha256(b"NRD fixture").hexdigest())
+
+    def test_docker_version_does_not_bypass_exact_nrd_hash_check(self):
+        result = json.dumps({"isaacsim": "5.0.0.0", "nrd_libraries": [
+            {"path": "/isaac-sim/extscache/libNRD.so.3.2.3", "sha256": "wrong"}]})
+        with patch.object(settings.subprocess, "check_output", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "does not match the verified ABI"):
+                settings.inspect_simulator(Path("/tmp/python.sh"))
+
+    def test_binary_isaac6_version_remains_unsupported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lib = root / "extscache/omni.hydra.rtx-test/bin/deps/libNRD.so.3.2.3"
+            lib.parent.mkdir(parents=True)
+            lib.write_bytes(b"NRD fixture")
+            (root / "VERSION").write_text("6.0.1+release\n")
+            result = settings._probe_simulator_installation([root])
+            with patch.object(settings.subprocess, "check_output", return_value=json.dumps(result)):
+                with self.assertRaisesRegex(RuntimeError, "requires the verified Isaac Sim"):
+                    settings.inspect_simulator(Path("/tmp/python.sh"))
 
     def test_public_entry_does_not_accept_multi_env_override(self):
         result = subprocess.run([sys.executable, str(HERE / "run_reproducible.py"),
