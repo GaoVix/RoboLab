@@ -69,6 +69,7 @@ def clean_environment() -> dict[str, str]:
             result.pop(key)
     # Diagnostic preload libraries must never leak into policy or simulator jobs.
     result.pop("LD_PRELOAD", None)
+    result.pop("PYTHONEXE", None)
     result.update(OMNI_KIT_ACCEPT_EULA="YES", ACCEPT_EULA="Y",
                   OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1")
     return result
@@ -81,11 +82,61 @@ def policy_environment(openpi_root: Path) -> dict[str, str]:
     return result
 
 
-def simulator_environment(native: Path, policy_seed: int, run_index: int) -> dict[str, str]:
+def simulator_environment(native: Path, policy_seed: int, run_index: int,
+                          python: Path | None = None) -> dict[str, str]:
     result = clean_environment()
     result.update(PYTHONPATH=str(ROOT), LD_PRELOAD=str(native.resolve()),
+                  ROBOLAB_REPRO_NATIVE=str(native.resolve()),
                   ROBOLAB_REPRO_POLICY_SEED=str(policy_seed), ROBOLAB_REPRO_RUN_INDEX=str(run_index))
+    if python is not None and python.name == "python.sh":
+        # The official binary launcher overwrites LD_PRELOAD with libcarb.so.
+        # Use its supported PYTHONEXE hook after it has configured the environment.
+        binary = python.resolve().parent / "kit/python/bin/python3"
+        bridge = Path(__file__).with_name("native") / "isaac_python_with_controls.sh"
+        for executable in [binary, bridge]:
+            if not executable.is_file() or not os.access(executable, os.X_OK):
+                raise RuntimeError(f"Required simulator launch executable is missing: {executable}")
+        result.update(PYTHONEXE=str(bridge), ROBOLAB_REPRO_PYTHON=str(binary))
     return result
+
+
+def probe_native_preload() -> dict:
+    """Verify actual process-wide symbol bindings without calling NRD or using a GPU."""
+    import ctypes
+    import os
+    from pathlib import Path
+
+    expected = Path(os.environ["ROBOLAB_REPRO_NATIVE"]).resolve(strict=True)
+    if str(expected) not in Path("/proc/self/maps").read_text():
+        raise RuntimeError(f"NRD control preload is not mapped into the simulator process: {expected}")
+
+    class DlInfo(ctypes.Structure):
+        _fields_ = [("dli_fname", ctypes.c_char_p), ("dli_fbase", ctypes.c_void_p),
+                    ("dli_sname", ctypes.c_char_p), ("dli_saddr", ctypes.c_void_p)]
+
+    process = ctypes.CDLL(None)
+    dladdr = process.dladdr
+    dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(DlInfo)]
+    dladdr.restype = ctypes.c_int
+    bindings = {}
+    for name in ["GetComputeDispatches", "rand"]:
+        symbol = getattr(process, name)
+        info = DlInfo()
+        if not dladdr(ctypes.cast(symbol, ctypes.c_void_p), ctypes.byref(info)) or not info.dli_fname:
+            raise RuntimeError(f"Cannot identify the library providing {name}")
+        actual = Path(os.fsdecode(info.dli_fname)).resolve(strict=True)
+        if actual != expected:
+            raise RuntimeError(f"NRD control symbol {name} resolves to {actual}, expected {expected}")
+        bindings[name] = str(actual)
+    return {"native": str(expected), "symbols": bindings, "ld_preload": os.environ.get("LD_PRELOAD", "")}
+
+
+def inspect_native_preload(python: Path, native: Path) -> dict:
+    script = (inspect.getsource(probe_native_preload)
+              + "\nimport json\nprint(json.dumps(probe_native_preload()))\n")
+    return json.loads(subprocess.check_output(
+        [str(python), "-c", script], text=True,
+        env=simulator_environment(native, SCENE_SEED, 0, python=python)))
 
 
 def _probe_simulator_installation(roots=None, package_version=None):

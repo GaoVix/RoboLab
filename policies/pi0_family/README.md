@@ -98,6 +98,12 @@ to `--openpi-root`, `--policy-python`, and `--checkpoint`. OpenPI still needs
 its own environment; the RoboLab image includes only the OpenPI client.
 The compatibility check accepts both pip installations and the official binary
 layout (`/isaac-sim/VERSION`), while requiring the same verified NRD SHA256.
+The official binary `python.sh` overwrites `LD_PRELOAD` with `libcarb.so`.
+The launcher uses its supported `PYTHONEXE` hook to prepend the verified NRD
+controls after that assignment, preserving the official environment and
+`libcarb.so`. Both `--check` and actual simulator startup verify that
+`GetComputeDispatches` and `rand` resolve to the control library. This check
+does not start SimulationApp or make policy/NRD calls.
 
 Results use the original per-task `run_N.hdf5` and `episode_results.jsonl`
 layout, plus profile/seed/lifecycle metadata and logs. Repeat the exact command

@@ -1,9 +1,11 @@
 """CPU-only checks for isolation, seed lifecycle, and rejecting mixed profiles."""
 import importlib.util
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,11 +23,15 @@ import serve_reproducible as serving
 class ReproducibleSettingsTests(unittest.TestCase):
     def test_policy_process_never_inherits_native_diagnostic_preloads(self):
         with patch.dict(os.environ, {"LD_PRELOAD": "/tmp/old_probe.so", "ROBO_NRD_LOG": "/tmp/old.log",
-                                     "ROBO_WATCH_DEBUG": "1", "CUDA_VISIBLE_DEVICES": "2"}):
+                                     "ROBO_WATCH_DEBUG": "1", "CUDA_VISIBLE_DEVICES": "2",
+                                     "PYTHONEXE": "/tmp/old_wrapper",
+                                     "ROBOLAB_REPRO_NATIVE": "/tmp/old_probe.so"}):
             env = settings.policy_environment(Path("/tmp/openpi"))
         self.assertNotIn("LD_PRELOAD", env)
         self.assertNotIn("ROBO_NRD_LOG", env)
         self.assertNotIn("ROBO_WATCH_DEBUG", env)
+        self.assertNotIn("PYTHONEXE", env)
+        self.assertNotIn("ROBOLAB_REPRO_NATIVE", env)
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "2")
         self.assertEqual(env["XLA_FLAGS"], "--xla_gpu_autotune_level=0")
 
@@ -149,6 +155,66 @@ class ReproducibleSettingsTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIs(servers[0]["policy"], policy)
         settings.verify_server_metadata(servers[0]["metadata"], 7)
+
+
+class NativeLaunchTests(unittest.TestCase):
+    """Exercise ELF loading through a binary launcher which overwrites LD_PRELOAD."""
+
+    @classmethod
+    def setUpClass(cls):
+        compiler = shutil.which("c++")
+        if not compiler:
+            raise unittest.SkipTest("C++ compiler needed for native launch regression checks")
+        cls.fixture = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.fixture.cleanup)
+        cls.root = Path(cls.fixture.name)
+        cls.library = cls.root / "controls.so"
+        subprocess.run([compiler, "-shared", "-fPIC", "-x", "c++", "-", "-o", str(cls.library)],
+                       input='extern "C" void GetComputeDispatches() {}\nextern "C" int rand() noexcept { return 0; }\n',
+                       text=True, capture_output=True, check=True)
+        cls.competing = cls.root / "competing.so"
+        shutil.copyfile(cls.library, cls.competing)
+        binary = cls.root / "kit/python/bin/python3"
+        binary.parent.mkdir(parents=True)
+        binary.symlink_to(sys.executable)
+        cls.wrapper = cls.root / "python.sh"
+        cls.wrapper.write_text(
+            '#!/bin/bash\nset -e\n'
+            'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+            'python_exe=${PYTHONEXE:-"${SCRIPT_DIR}/kit/python/bin/python3"}\n'
+            'export LD_PRELOAD=libc.so.6\n'
+            '$python_exe "$@"\n')
+        cls.wrapper.chmod(0o755)
+
+    def test_binary_launcher_overwrite_is_reproduced_and_fixed(self):
+        script = inspect.getsource(settings.probe_native_preload) + "\nprobe_native_preload()\n"
+        # Same failure mode as the official python.sh, before enabling its hook.
+        broken = subprocess.run([str(self.wrapper), "-c", script], text=True, capture_output=True,
+                                env=settings.simulator_environment(self.library, 0, 0))
+        self.assertNotEqual(broken.returncode, 0)
+        self.assertIn("NRD control preload is not mapped", broken.stderr)
+        checked = settings.inspect_native_preload(self.wrapper, self.library)
+        self.assertEqual(checked["symbols"], {
+            "GetComputeDispatches": str(self.library), "rand": str(self.library)})
+        self.assertEqual(checked["ld_preload"], f"{self.library}:libc.so.6")
+
+    def test_direct_python_launch_also_checks_real_bindings(self):
+        checked = settings.inspect_native_preload(Path(sys.executable), self.library)
+        self.assertEqual(checked["symbols"]["GetComputeDispatches"], str(self.library))
+        self.assertEqual(checked["symbols"]["rand"], str(self.library))
+        self.assertEqual(checked["ld_preload"], str(self.library))
+
+    def test_mapped_library_with_wrong_global_symbol_binding_is_rejected(self):
+        script = inspect.getsource(settings.probe_native_preload) + "\nprobe_native_preload()\n"
+        env = settings.simulator_environment(self.library, 0, 0)
+        env["LD_PRELOAD"] = f"{self.competing}:{self.library}"
+        result = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"resolves to {self.competing}", result.stderr)
+
+    def test_binary_launcher_missing_bundled_python_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "Required simulator launch executable is missing"):
+            settings.simulator_environment(self.library, 0, 0, python=self.root / "missing/python.sh")
 
 
 if __name__ == "__main__":

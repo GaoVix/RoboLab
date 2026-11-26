@@ -18,7 +18,7 @@ import urllib.request
 from zoneinfo import ZoneInfo
 
 from reproducible_settings import (
-    CACHE_SETTINGS, ROOT, SCENE_SEED, build_native, inspect_simulator,
+    CACHE_SETTINGS, ROOT, SCENE_SEED, build_native, inspect_native_preload, inspect_simulator,
     policy_environment, profile, profile_fingerprint, sha256, simulator_environment,
 )
 
@@ -86,11 +86,13 @@ def main() -> None:
             parser.error(f"Required path does not exist: {path}")
     stack = inspect_simulator(sim_python)
     native = build_native()
+    preload_check = inspect_native_preload(sim_python, native)
     plan = {"profile": profile(), "profile_fingerprint": profile_fingerprint(),
             "tasks": tasks, "policy_seeds": args.policy_seeds, "checkpoint": str(checkpoint),
             "sim_python": str(sim_python), "policy_python": str(policy_python),
             "openpi_root": str(openpi_root), "simulator_stack": stack,
             "native_preload": str(native), "native_preload_sha256": sha256(native),
+            "native_preload_check": preload_check,
             "video_mode": args.video_mode, "image_recording": False}
     if args.check:
         print(json.dumps({**plan, "tasks": f"{len(tasks)} selected", "gpu_jobs_started": 0}, indent=2))
@@ -151,7 +153,8 @@ def main() -> None:
                         "--run-index-offset", str(index), "--seed", str(SCENE_SEED), "--headless",
                         "--video-mode", args.video_mode, "--remote-host", "127.0.0.1", "--remote-port", str(port),
                         "--output-folder-name", str(output), "--kit_args", kit_args,
-                    ], cwd=ROOT, env=simulator_environment(native, seed, index), stdout=slog, stderr=subprocess.STDOUT)
+                    ], cwd=ROOT, env=simulator_environment(native, seed, index, python=sim_python),
+                        stdout=slog, stderr=subprocess.STDOUT)
                     life["simulator_pid"] = sim.pid
                     print(f"Run {task}, episode {index}, policy seed {seed}, one env", flush=True)
                     last_notice = time.monotonic()
@@ -166,7 +169,9 @@ def main() -> None:
                     if sim.returncode:
                         raise RuntimeError(f"Simulator failed; see {directory / f'run_{index}.sim.log'}")
                     if not completed(output, task, index):
-                        raise RuntimeError("Original evaluator exited without a completed episode result")
+                        raise RuntimeError(
+                            f"Original evaluator exited without a completed episode result; "
+                            f"see {directory / f'run_{index}.sim.log'}")
             finally:
                 stop(sim)
                 stop(policy)
